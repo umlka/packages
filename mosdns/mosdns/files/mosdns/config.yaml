@@ -1,0 +1,277 @@
+log:
+  level: error
+  file: "/var/log/mosdns.log"
+
+#api:
+  #http: "0.0.0.0:9091"
+
+plugins:
+  # 自定义 Hosts 重写
+  - tag: hosts
+    type: hosts
+    args:
+      files:
+        - "/etc/mosdns/rule/hosts.txt"
+
+  # 重定向请求的域名
+  - tag: redirect
+    type: redirect
+    args:
+      files:
+        - "/etc/mosdns/rule/redirect.txt"
+
+  # 白名单 加入的域名将跳过 黑名单 检测
+  - tag: whitelist
+    type: domain_set
+    args:
+      files:
+        - "/etc/mosdns/rule/whitelist.txt"
+
+  # 黑名单 加入的域名将屏蔽 DNS 解析
+  - tag: blocklist
+    type: domain_set
+    args:
+      files:
+        - "/etc/mosdns/rule/blocklist.txt"
+
+  # 广告列表
+  - tag: adslist
+    type: domain_set
+    args:
+      files:
+        - "/var/mosdns/geosite_category-ads-all.txt"
+
+  # PTR 黑名单 加入的域名将阻止 PTR 请求
+  - tag: local_ptr
+    type: domain_set
+    args:
+      files:
+        - "/etc/mosdns/rule/local-ptr.txt"
+
+  # 蓝名单 加入的域名将仅使用 "国内DNS服务器" 进行解析
+  - tag: bluelist
+    type: domain_set
+    args:
+      files:
+        - "/etc/mosdns/rule/bluelist.txt"
+
+  # 灰名单 加入的域名将仅使用 "国外DNS服务器" 进行解析
+  - tag: greylist
+    type: domain_set
+    args:
+      files:
+        - "/etc/mosdns/rule/greylist.txt"
+
+  # 国内域名
+  - tag: geosite_cn
+    type: domain_set
+    args:
+      files:
+        - "/var/mosdns/geosite_cn.txt"
+
+  # 国外域名
+  - tag: geosite_no_cn
+    type: domain_set
+    args:
+      files:
+        - "/var/mosdns/geosite_geolocation-!cn.txt"
+
+  # 国内IP
+  - tag: geoip_cn
+    type: ip_set
+    args:
+      files:
+        - "/var/mosdns/geoip_cn.txt"
+
+  # 缓存
+  - tag: lazy_cache
+    type: cache
+    args:
+      size: 8192
+      lazy_cache_ttl: 86400
+      dump_file: "/etc/mosdns/cache.dump"
+      dump_interval: 600
+
+  # 国内DNS服务器
+  - tag: forward_local
+    type: forward
+    args:
+      concurrent: 1 # 并发数。每次请求会从下面配置的 upstreams 里随机选取
+                    # concurrent 个 upstreams 发送请求。取最快返回的应答。超过 3 最多选
+                    # 3 个。默认 1 。
+      upstreams:    # []upstream, 上游服务器。至少要配置一个。
+        - tag: alidns
+          addr: "https://dns.alidns.com/dns-query"
+          dial_addr: "223.5.5.5"
+        - tag: dnspod
+          addr: "https://doh.pub/dns-query"
+          dial_addr: "1.12.12.12"
+
+  # 国外DNS服务器
+  - tag: forward_remote
+    type: forward
+    args:
+      concurrent: 1
+      upstreams:
+        - tag: cloudflare
+          addr: "https://one.one.one.one/dns-query"
+          dial_addr: "1.1.1.1"
+          enable_http3: true
+        - tag: google
+          addr: "https://dns.google/dns-query"
+          dial_addr: "8.8.8.8"
+
+  # 修改ttl (默认 0 不修改ttl)
+  - tag: ttl_sequence
+    type: sequence
+    args:
+      - exec: ttl 0-600
+
+  - tag: modify_response
+    type: sequence
+    args:
+      - exec: $ttl_sequence
+      - exec: accept
+
+  # 有响应终止返回
+  - tag: has_response
+    type: sequence
+    args:
+      - matches: has_resp
+        exec: goto modify_response
+
+  # 国内解析
+  - tag: local_sequence
+    type: sequence
+    args:
+      #- exec: prefer_ipv4
+      #- exec: ecs IPv4/24 IPv6/48 # WAN口下发的DNS所属IP段
+      - exec: $forward_local
+
+  # 国外解析
+  - tag: remote_sequence
+    type: sequence
+    args:
+      - exec: prefer_ipv4
+      #- exec: ecs IPv4/24 # 梯子VPS出口IP段
+      - exec: $forward_remote
+
+  # 查询拒绝名单
+  - tag: reject_sequence
+    type: sequence
+    args:
+      - matches: qname $blocklist
+        exec: reject 3
+      - matches: qname $adslist
+        exec: reject 3
+
+  # 查询蓝名单
+  - tag: bluelist_sequence
+    type: sequence
+    args:
+      - exec: $local_sequence
+      - exec: jump has_response
+      - exec: reject 3
+
+  # 查询灰名单
+  - tag: greylist_sequence
+    type: sequence
+    args:
+      - exec: $remote_sequence
+      - exec: jump has_response
+      - exec: reject 3
+
+  # 查询国内域名
+  - tag: query_is_cn_domain
+    type: sequence
+    args:
+      - matches: qname $geosite_cn
+        exec: $local_sequence
+
+  # 查询国外域名
+  - tag: query_is_no_cn_domain
+    type: sequence
+    args:
+      - matches: qname $geosite_no_cn
+        exec: $remote_sequence
+
+  # fallback 用本地服务器 sequence
+  # 返回非国内 IP 则 drop_resp
+  - tag: query_is_cn_ip
+    type: sequence
+    args:
+      - exec: $local_sequence
+      - exec: $ttl_sequence
+      - matches: "!resp_ip $geoip_cn"
+        exec: drop_resp
+
+  # fallback 用远程服务器 sequence
+  - tag: query_is_remote
+    type: sequence
+    args:
+      - exec: $remote_sequence
+      - exec: $ttl_sequence
+
+  # fallback 用远程服务器 sequence
+  - tag: fallback
+    type: fallback
+    args:
+      primary: query_is_cn_ip
+      secondary: query_is_remote
+      threshold: 500
+      always_standby: true
+
+  # 主要的运行逻辑插件
+  # sequence 插件中调用的插件 tag 必须在 sequence 前定义，
+  # 否则 sequence 找不到对应插件。
+  - tag: main_sequence
+    type: sequence
+    args:
+      - exec: $hosts
+      - matches: has_resp
+        exec: accept
+
+      - exec: $redirect
+      - matches: has_resp
+        exec: accept
+
+      - matches: "!qname $whitelist"
+        exec: jump reject_sequence
+      - matches: qtype 12
+        exec: reject 3
+      - matches: qtype 65
+        exec: reject 3
+      - matches: qname $local_ptr
+        exec: reject 3
+
+      - exec: $lazy_cache
+      - matches: has_resp
+        exec: accept
+
+      - matches: qname $bluelist
+        exec: jump bluelist_sequence
+
+      - matches: qname $greylist
+        exec: jump greylist_sequence
+
+      - exec: $query_is_cn_domain
+      - exec: jump has_response
+
+      - exec: $query_is_no_cn_domain
+      - exec: jump has_response
+
+      - exec: $fallback
+
+  # 启动 udp 服务器。
+  - tag: udp_server
+    type: udp_server
+    args:
+      entry: main_sequence
+      listen: ":5335"
+
+  # 启动 tcp 服务器。
+  - tag: tcp_server
+    type: tcp_server
+    args:
+      entry: main_sequence
+      listen: ":5335"
